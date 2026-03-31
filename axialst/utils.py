@@ -130,7 +130,7 @@ def auto_sigma(positions):
     tree = cKDTree(positions)
     dists, _ = tree.query(positions, k=2)       # k=2: self + nearest
     median_nn = np.median(dists[:, 1])
-    return float(max(median_nn * 5.0, 1.0))
+    return float(max(median_nn * 3.0, 1.0))
 
 
 def auto_patch_size(positions, target_cells_per_patch=60):

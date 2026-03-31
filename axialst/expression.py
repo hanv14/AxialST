@@ -76,12 +76,17 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     n_virtual   = len(virtual_adata)
     n_genes     = comb_X.shape[1]
 
-    # Spatial KD-tree for fallback
+    # Spatial KD-tree for fallback and spatial proximity weighting
     kdtree = cKDTree(comb_pos)
+
+    # Auto-compute spatial bandwidth for xy-proximity weighting:
+    # use median nearest-neighbor distance × 3 as the Gaussian sigma
+    _nn_dists, _ = kdtree.query(comb_pos, k=2)
+    sigma_spatial = float(np.median(_nn_dists[:, 1])) * 5.0
+    sigma_spatial = max(sigma_spatial, 1.0)
 
     # Pre-compute cosine similarities  (combined × virtual)
     if niche_desc_virtual is not None and comb_niche_desc is not None:
-        # Compute in chunks to limit memory
         cos_sims = cos_sim(comb_niche_desc, niche_desc_virtual)  # (R, V)
     else:
         cos_sims = None
@@ -112,13 +117,21 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
             # Last resort: nearest neighbours regardless of type
             _, nn = kdtree.query(virt_pos[i], k=min(k_sam, len(combined)))
             nn = np.atleast_1d(nn)
-            virt_X[i] = comb_X[nn].mean(axis=0)
+            # Distance-weighted average for fallback too
+            fb_dists = np.linalg.norm(comb_pos[nn] - virt_pos[i], axis=1)
+            fb_w = np.exp(-0.5 * (fb_dists / sigma_spatial) ** 2)
+            fb_w_sum = fb_w.sum()
+            if fb_w_sum > 0:
+                fb_w /= fb_w_sum
+            else:
+                fb_w = np.ones(len(nn)) / len(nn)
+            virt_X[i] = (comb_X[nn] * fb_w[:, None]).sum(axis=0)
             donor_counts[i] = len(nn)
             continue
 
         donor_counts[i] = len(cands)
 
-        # --- weights: z-proximity × niche similarity ---
+        # --- weights: z-proximity × niche similarity × spatial proximity ---
         w_z = z_weights[cands]
 
         if cos_sims is not None:
@@ -126,28 +139,29 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         else:
             w_niche = np.ones(len(cands))
 
-        w = w_z * w_niche
+        # Spatial proximity: Gaussian kernel on xy-distance with floor
+        xy_dists = np.linalg.norm(comb_pos[cands] - virt_pos[i], axis=1)
+        w_spatial = np.exp(-0.5 * (xy_dists / sigma_spatial) ** 2)
+        w_spatial = np.maximum(w_spatial, 1e-6)  # floor to avoid zeros
+
+        w = w_z * w_niche * w_spatial
         w_sum = w.sum()
         if w_sum > 0:
             w /= w_sum
         else:
             w = np.ones(len(cands)) / len(cands)
 
-        # --- sample expression (Option A) ---
+        # --- whole-cell weighted average of sampled donors ---
         k_use = min(k_sam, len(cands))
         if len(cands) <= k_use:
-            # Weighted average of all candidates
             virt_X[i] = (comb_X[cands] * w[:, None]).sum(axis=0)
         else:
-            chosen = rng.choice(len(cands), size=k_use, p=w, replace=False)
-            sel = cands[chosen]
-            sel_w = w[chosen]
+            # Select top-k by weight for deterministic, spatially-focused donors
+            top_k = np.argpartition(w, -k_use)[-k_use:]
+            sel = cands[top_k]
+            sel_w = w[top_k]
             sel_w /= sel_w.sum()
-
-            # Per-gene donor sampling
-            for g in range(n_genes):
-                donor = rng.choice(len(sel), p=sel_w)
-                virt_X[i, g] = comb_X[sel[donor], g]
+            virt_X[i] = (comb_X[sel] * sel_w[:, None]).sum(axis=0)
 
     virtual_adata.X = virt_X
 

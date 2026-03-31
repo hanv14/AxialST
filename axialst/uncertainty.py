@@ -23,7 +23,7 @@ import numpy as np
 # Individual uncertainty sources
 # ===================================================================
 
-def donor_pool_uncertainty(donor_counts, tau=10.0):
+def donor_pool_uncertainty(donor_counts, tau=5.0):
     """
     Source 1.  u₁ = exp(−|donors| / τ)
 
@@ -103,8 +103,8 @@ def compute_confidence(u1, u2, u3, u4,
         # produce a confidence spread centred near 0.5 – 0.7.
         # These should be calibrated with ``calibrate_weights`` for
         # production use.
-        weights = [0.5, 0.5, 0.5, 0.3]
-        bias = -1.0            # shift baseline upward
+        weights = [1.0, 0.8, 1.2, 0.5]
+        bias = -0.5            # less compression → wider spread
 
     u1 = np.atleast_1d(np.asarray(u1, dtype=np.float64))
     u2 = np.atleast_1d(np.asarray(u2, dtype=np.float64))

@@ -113,7 +113,7 @@ def place_cells_in_patch(centre, n_cells, type_indices, niche_id,
     half = patch_size / 2.0
     positions = np.empty((n_cells, 2), dtype=np.float64)
     template = templates.get(niche_id, {})
-    jitter_std = patch_size * 0.05
+    jitter_std = patch_size * 0.02
 
     for i in range(n_cells):
         offsets = template.get(type_indices[i])
