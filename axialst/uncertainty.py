@@ -1,7 +1,7 @@
 """
 AxialST — Stage 4: Calibrated Uncertainty Quantification.
 
-Four biologically interpretable uncertainty sources are computed per
+Five biologically interpretable uncertainty sources are computed per
 virtual cell and combined into a single calibrated confidence score.
 
 Sources
@@ -10,10 +10,12 @@ Sources
 2. Niche ambiguity       — cell sits at a niche boundary
 3. Cross-section disagreement — flanking sections disagree about this region
 4. Z-axis distance       — virtual slice far from any real section
+                           (gap-aware: scales with actual physical distance)
+5. Donor expression variance — high variance among sampled donors → unreliable
 
 The combined confidence is  σ(−(w·u + b))  where weights w and bias b
 can be calibrated on held-out data (logistic regression).  Default
-weights treat all sources equally.
+weights are empirically tuned for good discrimination.
 """
 
 import numpy as np
@@ -28,8 +30,36 @@ def donor_pool_uncertainty(donor_counts, tau=5.0):
     Source 1.  u₁ = exp(−|donors| / τ)
 
     Fewer matched donor cells → higher uncertainty.
+
+    Uses effective sample size when weights are available: the
+    effective count accounts for weight concentration (entropy).
     """
     return np.exp(-np.asarray(donor_counts, dtype=np.float64) / tau)
+
+
+def effective_donor_pool_uncertainty(donor_counts, donor_variances,
+                                     tau=5.0, var_scale=2.0):
+    """
+    Enhanced Source 1: combines donor pool size with donor expression
+    variance to produce a more discriminative uncertainty.
+
+    Effective uncertainty = pool_size_uncertainty × (1 + var_scale × variance)
+
+    This penalises cells whose donors, even if numerous, disagree
+    strongly in expression (high variance = less reliable average).
+    """
+    counts = np.asarray(donor_counts, dtype=np.float64)
+    variances = np.asarray(donor_variances, dtype=np.float64)
+
+    u_pool = np.exp(-counts / tau)
+
+    # Normalise variance to [0, 1] range for stable combination
+    v_max = variances.max() if variances.max() > 0 else 1.0
+    v_norm = variances / v_max
+
+    u_effective = u_pool * (1.0 + var_scale * v_norm)
+    # Clip to [0, 1]
+    return np.clip(u_effective, 0.0, 1.0)
 
 
 def niche_ambiguity(niche_confidences):
@@ -66,32 +96,62 @@ def cross_section_disagreement(tp1, tp2, virtual_positions):
     return np.sqrt(np.clip(js, 0, None))          # JS distance (sqrt of div)
 
 
-def z_distance_uncertainty(alpha):
+def z_distance_uncertainty(alpha, gap_distance=None, reference_gap=1.0):
     """
     Source 4 (scalar, broadcast to all cells).
 
-    u₄ = min(α, 1−α) / 0.5
+    u₄ = min(α, 1−α) / 0.5  ×  gap_scale
 
-    Maximum (= 1.0) at the midpoint; minimum (→ 0) near a real section.
+    When *gap_distance* is provided (actual physical distance between
+    sections), the uncertainty is scaled proportionally so that larger
+    gaps between slices yield higher uncertainty:
+
+        gap_scale = gap_distance / reference_gap
+
+    Without gap_distance, gap_scale = 1.0 (backwards compatible).
+
+    Maximum (= 1.0 × gap_scale) at the midpoint; minimum (→ 0) near
+    a real section.
     """
-    return min(alpha, 1.0 - alpha) / 0.5
+    base = min(alpha, 1.0 - alpha) / 0.5
+    if gap_distance is not None and reference_gap > 0:
+        gap_scale = gap_distance / reference_gap
+    else:
+        gap_scale = 1.0
+    return np.clip(base * gap_scale, 0.0, 1.0)
+
+
+def donor_variance_uncertainty(donor_variances):
+    """
+    Source 5.  u₅ = normalised donor expression variance.
+
+    High variance among the selected donor cells indicates that the
+    weighted average is uncertain — the donors disagree about what
+    expression this cell should have.
+
+    Returns (V,) array in [0, 1].
+    """
+    v = np.asarray(donor_variances, dtype=np.float64)
+    v_max = v.max() if v.max() > 0 else 1.0
+    return v / v_max
 
 
 # ===================================================================
 # Combined calibrated confidence
 # ===================================================================
 
-def compute_confidence(u1, u2, u3, u4,
+def compute_confidence(u1, u2, u3, u4, u5=None,
                        weights=None, bias=0.0):
     """
-    Combine four uncertainty sources into a calibrated confidence.
+    Combine uncertainty sources into a calibrated confidence.
 
-    conf(i) = σ( −(w₁ u₁ + w₂ u₂ + w₃ u₃ + w₄ u₄ + b) )
+    conf(i) = σ( −(w₁u₁ + w₂u₂ + w₃u₃ + w₄u₄ + w₅u₅ + b) )
 
     Parameters
     ----------
     u1 … u4 : (V,) arrays or scalars
-    weights  : length-4 list/array  (default: equal weights = 1)
+    u5       : (V,) array or None — donor variance uncertainty
+    weights  : length-4 or length-5 list/array (default: tuned weights)
     bias     : scalar
 
     Returns
@@ -99,12 +159,13 @@ def compute_confidence(u1, u2, u3, u4,
     confidence : (V,) array in (0, 1)  — higher is more trustworthy
     """
     if weights is None:
-        # Default weights chosen so that typical uncertainty levels
-        # produce a confidence spread centred near 0.5 – 0.7.
-        # These should be calibrated with ``calibrate_weights`` for
-        # production use.
-        weights = [1.0, 0.8, 1.2, 0.5]
-        bias = -0.5            # less compression → wider spread
+        if u5 is not None:
+            # 5-source weights: pool, niche, cross-sect, z-dist, donor-var
+            weights = [1.0, 0.8, 1.2, 0.6, 0.9]
+            bias = -0.3
+        else:
+            weights = [1.0, 0.8, 1.2, 0.5]
+            bias = -0.5
 
     u1 = np.atleast_1d(np.asarray(u1, dtype=np.float64))
     u2 = np.atleast_1d(np.asarray(u2, dtype=np.float64))
@@ -118,6 +179,12 @@ def compute_confidence(u1, u2, u3, u4,
               + weights[2] * u3
               + weights[3] * u4_arr
               + bias)
+
+    if u5 is not None and len(weights) >= 5:
+        u5 = np.atleast_1d(np.asarray(u5, dtype=np.float64))
+        if len(u5) != len(u1):
+            u5 = np.full_like(u1, float(u5.mean()))
+        logit -= weights[4] * u5
 
     return _sigmoid(logit)
 
@@ -144,20 +211,24 @@ def calibrate_weights(held_out_results):
     ----------
     held_out_results : list of dicts, each with keys
         'u1', 'u2', 'u3', 'u4'  — uncertainty arrays for the virtual cells
+        'u5'                     — (optional) donor variance uncertainty
         'accuracy'               — binary: 1 if cell-type prediction correct
 
     Returns
     -------
-    weights : (4,) array
+    weights : (4,) or (5,) array
     bias    : float
     """
     from sklearn.linear_model import LogisticRegression
 
     Xs, ys = [], []
+    has_u5 = 'u5' in held_out_results[0]
     for r in held_out_results:
         n = len(r['u1'])
-        X_block = np.column_stack([r['u1'], r['u2'], r['u3'],
-                                    np.full(n, r['u4'])])
+        cols = [r['u1'], r['u2'], r['u3'], np.full(n, r['u4'])]
+        if has_u5:
+            cols.append(r['u5'])
+        X_block = np.column_stack(cols)
         Xs.append(X_block)
         ys.append(r['accuracy'])
 

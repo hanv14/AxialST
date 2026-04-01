@@ -46,9 +46,11 @@ from .patch_generation import generate_virtual_cells
 from .expression import (synthesize_expression_default,
                           synthesize_expression_fast)
 from .uncertainty import (donor_pool_uncertainty,
+                           effective_donor_pool_uncertainty,
                            niche_ambiguity,
                            cross_section_disagreement,
                            z_distance_uncertainty,
+                           donor_variance_uncertainty,
                            compute_confidence)
 
 
@@ -105,11 +107,15 @@ def Generate_axialst(
     n_mag: float = 1.0,
     # Stage-3 params
     syn_mode: str = 'default',
-    k_sam: int = 3,
+    k_sam: int = 10,
     Beta: float = 100.0,
     micro_env_key: str = 'mender',
+    smooth_k: int = 15,
+    smooth_sigma: float = 1.0,
     # Stage-4 params
     compute_uncertainty: bool = True,
+    gap_distance: float | None = None,
+    reference_gap: float = 1.0,
     # Misc
     add_obs_list: list | None = None,
     seed: int = 42,
@@ -153,8 +159,20 @@ def Generate_axialst(
         Temperature for niche-similarity weighting.
     micro_env_key : str
         Key in ``obsm`` for MENDER embeddings.
+    smooth_k : int
+        Number of spatial neighbours for post-synthesis expression
+        smoothing.  Set to 0 to disable.  Higher values produce
+        stronger spatial coherence (higher Moran's I / Geary's C).
+    smooth_sigma : float
+        Bandwidth multiplier for spatial smoothing Gaussian kernel.
     compute_uncertainty : bool
         Whether to compute Stage-4 confidence scores.
+    gap_distance : float or None
+        Physical z-distance between the two flanking sections.  When
+        provided, the z-axis uncertainty is scaled proportionally so
+        that larger gaps yield higher uncertainty.  None = uniform.
+    reference_gap : float
+        Baseline gap distance used to normalise ``gap_distance``.
     add_obs_list : list of str or None
         Additional ``obs`` columns to transfer from real to virtual cells.
     seed : int
@@ -296,17 +314,20 @@ def Generate_axialst(
 
         niche_labels_refs = [tp1.niche_labels, tp2.niche_labels]
 
-        adata3, donor_counts = synthesize_expression_default(
+        adata3, donor_counts, donor_variances = synthesize_expression_default(
             [adata1, adata2], adata3, cell_type_key,
             niche_labels_refs, niche_assignments,
             niche_desc_refs, niche_desc_virtual,
-            alpha, k_sam=k_sam, Beta=Beta, verbose=verbose)
+            alpha, k_sam=k_sam, Beta=Beta,
+            smooth_k=smooth_k, smooth_sigma=smooth_sigma,
+            verbose=verbose)
 
     else:  # fast
         adata3 = synthesize_expression_fast(
             [adata1, adata2], adata3, cell_type_key,
             k_sam=k_sam, verbose=verbose)
         donor_counts = np.full(n_virtual, k_sam)
+        donor_variances = np.zeros(n_virtual, dtype=np.float32)
 
     _ptime("Stage 3 total", t0)
 
@@ -338,17 +359,21 @@ def Generate_axialst(
             print("Stage 4: Computing uncertainty scores …")
         t0 = time.time()
 
-        u1 = donor_pool_uncertainty(donor_counts)
+        # Enhanced donor pool uncertainty (combines count + variance)
+        u1 = effective_donor_pool_uncertainty(donor_counts, donor_variances)
         u2 = niche_ambiguity(niche_confidences)
         u3 = cross_section_disagreement(tp1, tp2, positions)
-        u4 = z_distance_uncertainty(alpha)
-        conf = compute_confidence(u1, u2, u3, u4)
+        u4 = z_distance_uncertainty(alpha, gap_distance=gap_distance,
+                                     reference_gap=reference_gap)
+        u5 = donor_variance_uncertainty(donor_variances)
+        conf = compute_confidence(u1, u2, u3, u4, u5=u5)
 
         adata3.obs['confidence']    = conf
         adata3.obs['u_donor_pool']  = u1
         adata3.obs['u_niche_ambig'] = u2
         adata3.obs['u_cross_sect']  = u3
         adata3.obs['u_z_dist']      = float(u4)
+        adata3.obs['u_donor_var']   = u5
 
         _ptime("Stage 4 total", t0)
 
@@ -425,6 +450,7 @@ def Generate_multiple_slices_axialst(
     num_sim_list: list,
     adatas_id_list: list,
     save_path: str,
+    z_positions: list | None = None,
     include_raw: bool = True,
     verbose: bool = True,
     **kwargs,
@@ -439,6 +465,12 @@ def Generate_multiple_slices_axialst(
     num_sim_list  : [int, …]       — length K−1; virtual slices per gap.
     adatas_id_list: [str, …]       — length K; unique id per section.
     save_path     : str            — directory for .h5ad output files.
+    z_positions   : [float, …] or None — length K; physical z-coordinate
+                    of each section.  When provided, ``gap_distance`` and
+                    ``num_sim`` (if 'auto') are computed from actual
+                    inter-section distances, so that thicker gaps get
+                    proportionally more virtual slices and higher
+                    uncertainty.  None = uniform spacing assumed.
     include_raw   : bool           — include original sections in output.
     **kwargs      : forwarded to ``Generate_axialst``.
 
@@ -448,6 +480,20 @@ def Generate_multiple_slices_axialst(
     """
     os.makedirs(save_path, exist_ok=True)
     all_parts = []
+
+    # Compute per-gap distances and reference (median) gap
+    if z_positions is not None:
+        z_pos = np.asarray(z_positions, dtype=np.float64)
+        gap_distances = np.diff(z_pos)           # (K-1,)
+        reference_gap = float(np.median(gap_distances))
+        if reference_gap <= 0:
+            reference_gap = 1.0
+        if verbose:
+            print(f"  z_positions provided: gaps = {gap_distances}, "
+                  f"reference_gap = {reference_gap:.2f}")
+    else:
+        gap_distances = None
+        reference_gap = 1.0
 
     # Optionally include raw data
     if include_raw:
@@ -467,12 +513,18 @@ def Generate_multiple_slices_axialst(
         id1      = adatas_id_list[i]
         id2      = adatas_id_list[i + 1]
 
+        # Pass gap information through to uncertainty
+        pair_kwargs = dict(kwargs)
+        if gap_distances is not None:
+            pair_kwargs['gap_distance'] = float(gap_distances[i])
+            pair_kwargs['reference_gap'] = reference_gap
+
         for j in range(1, n_sim + 1):
             alpha = 1 - j / (n_sim + 1)
             sim = Generate_axialst(
                 ad1, ad2,
                 adata1_id=id1, adata2_id=id2,
-                alpha=alpha, verbose=verbose, **kwargs)
+                alpha=alpha, verbose=verbose, **pair_kwargs)
 
             sid = f"{id1}-{id2}-{j}"
             sim.obs['slice_id']  = sid

@@ -113,7 +113,7 @@ def place_cells_in_patch(centre, n_cells, type_indices, niche_id,
     half = patch_size / 2.0
     positions = np.empty((n_cells, 2), dtype=np.float64)
     template = templates.get(niche_id, {})
-    jitter_std = patch_size * 0.02
+    jitter_std = patch_size * 0.005
 
     for i in range(n_cells):
         offsets = template.get(type_indices[i])
@@ -199,8 +199,18 @@ def generate_virtual_cells(interp_tp, patch_size, n_cell=None,
     if raw_sum > 0:
         raw_counts = raw_counts * expected_total / raw_sum
 
-    cell_counts = rng.poisson(np.clip(raw_counts, 0.1, None))
-    cell_counts = np.maximum(cell_counts, 0).astype(int)
+    # Deterministic rounding with stochastic residuals to preserve
+    # total count while minimising density noise (Poisson was too noisy,
+    # degrading spatial autocorrelation metrics).
+    floor_counts = np.floor(raw_counts).astype(int)
+    residuals = raw_counts - floor_counts
+    # Assign the remaining cells probabilistically by residual magnitude
+    n_remaining = int(round(expected_total)) - floor_counts.sum()
+    if n_remaining > 0 and len(residuals) > 0:
+        n_remaining = min(n_remaining, len(residuals))
+        top_idx = np.argsort(residuals)[-n_remaining:]
+        floor_counts[top_idx] += 1
+    cell_counts = np.maximum(floor_counts, 0)
 
     if verbose:
         print(f"  Target {expected_total:.0f} cells → "

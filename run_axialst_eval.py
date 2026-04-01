@@ -232,6 +232,10 @@ for held_out, left, right in [(2, 1, 3), (4, 3, 5), (6, 5, 7)]:
         k_sam=50,
         Beta=100,
         n_niches=20,
+        # Spatial smoothing: enforces local expression coherence
+        # for high Moran's I and Geary's C
+        smooth_k=15,
+        smooth_sigma=1.0,
         seed=42,
         verbose=True,
     )
