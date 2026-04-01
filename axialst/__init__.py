@@ -108,7 +108,7 @@ def Generate_axialst(
     # Stage-3 params
     syn_mode: str = 'default',
     k_sam: int = 1,
-    Beta: float = 5.0,
+    Beta: float = 0.0,
     micro_env_key: str = 'mender',
     smooth_k: int = 0,
     smooth_sigma: float = 1.0,

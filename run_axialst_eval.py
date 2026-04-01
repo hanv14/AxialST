@@ -230,13 +230,37 @@ for held_out, left, right in [(2, 1, 3), (4, 3, 5), (6, 5, 7)]:
         n_mag=1.0,
         syn_mode='default',
         k_sam=1,
-        Beta=5,
+        Beta=0,
         n_niches=20,
         seed=42,
         verbose=True,
     )
     print(f"  → {sim.n_obs} cells in {time.time() - t0:.1f}s")
     reconstructions[held_out] = sim
+
+
+# ===================================================================
+# 2b. Uncertainty summary for reconstructed slices
+# ===================================================================
+
+print("\n" + "=" * 60)
+print("Uncertainty summary for reconstructed slices")
+print("=" * 60)
+
+u_cols = ['confidence', 'u_donor_pool', 'u_niche_ambig',
+          'u_cross_sect', 'u_z_dist', 'u_donor_var']
+
+for held_out in [2, 4, 6]:
+    sim = reconstructions[held_out]
+    print(f"\n  Slice {held_out} ({sim.n_obs} cells):")
+    for col in u_cols:
+        if col in sim.obs.columns:
+            vals = sim.obs[col].values
+            print(f"    {col:20s}  mean={np.mean(vals):.4f}  "
+                  f"std={np.std(vals):.4f}  "
+                  f"min={np.min(vals):.4f}  max={np.max(vals):.4f}")
+        else:
+            print(f"    {col:20s}  (not computed)")
 
 
 # ===================================================================

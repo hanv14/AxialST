@@ -31,7 +31,7 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
                                   niche_labels_virtual,
                                   niche_desc_refs,
                                   niche_desc_virtual,
-                                  alpha, k_sam=1, Beta=5,
+                                  alpha, k_sam=1, Beta=0,
                                   smooth_k=0, smooth_sigma=1.0,
                                   smooth_alpha=0.0,
                                   verbose=True):
@@ -93,9 +93,9 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     # Spatial KD-tree
     kdtree = cKDTree(comb_pos)
 
-    # Spatial bandwidth: median NN distance × 3
+    # Spatial bandwidth: tight to strongly favour nearest donors
     _nn_dists, _ = kdtree.query(comb_pos, k=2)
-    sigma_spatial = float(np.median(_nn_dists[:, 1])) * 3.0
+    sigma_spatial = float(np.median(_nn_dists[:, 1])) * 1.5
     sigma_spatial = max(sigma_spatial, 1.0)
 
     # Pre-compute cosine similarities  (combined × virtual)
@@ -118,35 +118,21 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         ct = virt_types[i]
         ni = niche_labels_virtual[i] if niche_labels_virtual is not None else -1
 
-        # --- spatial pre-filter: only consider nearby reference cells ---
+        # --- spatial pre-filter: same type within spatial radius ---
+        # Skip niche filtering to maximise spatial locality of donors.
+        # Niche constraints can exclude the spatially nearest same-type
+        # cell, degrading spatial autocorrelation preservation.
         nearby = np.array(virt_nbr_lists[i], dtype=int) if virt_nbr_lists[i] else np.array([], dtype=int)
 
-        # --- joint mask: same type AND same niche (within spatial radius) ---
         if len(nearby) > 0:
             type_mask = comb_types[nearby] == ct
-            if ni >= 0 and comb_niche_labels is not None:
-                niche_mask = comb_niche_labels[nearby] == ni
-                joint_mask = type_mask & niche_mask
-                if joint_mask.sum() < 1:
-                    joint_mask = type_mask
-            else:
-                joint_mask = type_mask
-            cands = nearby[joint_mask]
+            cands = nearby[type_mask]
         else:
             cands = np.array([], dtype=int)
 
         # Broaden to global type-match if no local candidates
         if len(cands) < 1:
-            global_type_mask = comb_types == ct
-            if ni >= 0 and comb_niche_labels is not None:
-                global_niche_mask = comb_niche_labels == ni
-                global_joint = global_type_mask & global_niche_mask
-                if global_joint.sum() >= 1:
-                    cands = np.where(global_joint)[0]
-                else:
-                    cands = np.where(global_type_mask)[0]
-            else:
-                cands = np.where(global_type_mask)[0]
+            cands = np.where(comb_types == ct)[0]
 
         if len(cands) == 0:
             # Last resort: nearest neighbour regardless of type
@@ -167,20 +153,20 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
 
         donor_counts[i] = len(cands)
 
-        # --- weights: z-proximity × niche similarity × spatial proximity ---
+        # --- weights: z-proximity × spatial proximity ---
+        # Niche similarity (Beta) is optional; Beta=0 disables it.
         w_z = z_weights[cands]
-
-        if cos_sims is not None:
-            w_niche = np.exp(Beta * cos_sims[cands, i])
-        else:
-            w_niche = np.ones(len(cands))
 
         # Spatial proximity: Gaussian kernel on xy-distance
         xy_dists = np.linalg.norm(comb_pos[cands] - virt_pos[i], axis=1)
         w_spatial = np.exp(-0.5 * (xy_dists / sigma_spatial) ** 2)
         w_spatial = np.maximum(w_spatial, 1e-6)
 
-        w = w_z * w_niche * w_spatial
+        w = w_z * w_spatial
+
+        if Beta > 0 and cos_sims is not None:
+            w_niche = np.exp(Beta * cos_sims[cands, i])
+            w *= w_niche
         w_sum = w.sum()
         if w_sum > 0:
             w /= w_sum
