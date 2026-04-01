@@ -32,7 +32,8 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
                                   niche_desc_refs,
                                   niche_desc_virtual,
                                   alpha, k_sam=10, Beta=100,
-                                  smooth_k=15, smooth_sigma=1.0,
+                                  smooth_k=6, smooth_sigma=1.0,
+                                  smooth_alpha=0.15,
                                   verbose=True):
     """
     Niche-coherent expression synthesis (Stage 3 — default mode).
@@ -85,11 +86,11 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     # Spatial KD-tree for fallback and spatial proximity weighting
     kdtree = cKDTree(comb_pos)
 
-    # Tighter spatial bandwidth: median NN distance × 2 (was × 5)
-    # This focuses donor selection on truly local cells, preserving
-    # spatial autocorrelation patterns.
+    # Moderate spatial bandwidth: median NN distance × 3
+    # Balances locality (preserving spatial structure) against having
+    # enough donors for a reliable average.
     _nn_dists, _ = kdtree.query(comb_pos, k=2)
-    sigma_spatial = float(np.median(_nn_dists[:, 1])) * 2.0
+    sigma_spatial = float(np.median(_nn_dists[:, 1])) * 3.0
     sigma_spatial = max(sigma_spatial, 1.0)
 
     # Pre-compute cosine similarities  (combined × virtual)
@@ -199,15 +200,17 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         if len(sel) > 1:
             donor_variances[i] = float(comb_X[sel].var(axis=0).mean())
 
-    # --- Spatial smoothing pass ---
-    # This k-NN Gaussian-weighted averaging enforces local expression
-    # coherence, directly boosting Moran's I and Geary's C.
-    if smooth_k > 0 and n_virtual > smooth_k:
+    # --- Gentle spatial smoothing pass ---
+    # Light blending (default 15%) with k-NN neighbourhood mean.
+    # This nudges outlier cells toward local consensus without
+    # overwriting per-gene spatial autocorrelation structure.
+    if smooth_k > 0 and smooth_alpha > 0 and n_virtual > smooth_k:
         if verbose:
             print(f"  Applying spatial smoothing (k={smooth_k}, "
-                  f"sigma_factor={smooth_sigma:.1f}) …")
+                  f"blend={smooth_alpha:.2f}) …")
         virt_X = spatial_smooth_expression(
-            virt_pos, virt_X, k=smooth_k, sigma_factor=smooth_sigma)
+            virt_pos, virt_X, k=smooth_k, sigma_factor=smooth_sigma,
+            blend=smooth_alpha)
 
     virtual_adata.X = virt_X
 

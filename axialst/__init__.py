@@ -110,8 +110,9 @@ def Generate_axialst(
     k_sam: int = 10,
     Beta: float = 100.0,
     micro_env_key: str = 'mender',
-    smooth_k: int = 15,
+    smooth_k: int = 6,
     smooth_sigma: float = 1.0,
+    smooth_alpha: float = 0.15,
     # Stage-4 params
     compute_uncertainty: bool = True,
     gap_distance: float | None = None,
@@ -161,10 +162,13 @@ def Generate_axialst(
         Key in ``obsm`` for MENDER embeddings.
     smooth_k : int
         Number of spatial neighbours for post-synthesis expression
-        smoothing.  Set to 0 to disable.  Higher values produce
-        stronger spatial coherence (higher Moran's I / Geary's C).
+        smoothing.  Set to 0 to disable.
     smooth_sigma : float
         Bandwidth multiplier for spatial smoothing Gaussian kernel.
+    smooth_alpha : float
+        Blend factor for spatial smoothing (0 = no smoothing,
+        1 = full replacement).  Default 0.15 gives a gentle nudge
+        that reduces noise without overwriting spatial structure.
     compute_uncertainty : bool
         Whether to compute Stage-4 confidence scores.
     gap_distance : float or None
@@ -320,7 +324,7 @@ def Generate_axialst(
             niche_desc_refs, niche_desc_virtual,
             alpha, k_sam=k_sam, Beta=Beta,
             smooth_k=smooth_k, smooth_sigma=smooth_sigma,
-            verbose=verbose)
+            smooth_alpha=smooth_alpha, verbose=verbose)
 
     else:  # fast
         adata3 = synthesize_expression_fast(

@@ -133,29 +133,31 @@ def auto_sigma(positions):
     return float(max(median_nn * 3.0, 1.0))
 
 
-def spatial_smooth_expression(positions, X, k=15, sigma_factor=1.0):
+def spatial_smooth_expression(positions, X, k=6, sigma_factor=1.0,
+                              blend=0.15):
     """
-    Spatially smooth expression matrix using adaptive Gaussian-weighted
-    k-NN averaging.  This enforces local coherence in gene expression,
-    directly boosting Moran's I and Geary's C.
+    Gently smooth expression by blending each cell with a k-NN local
+    average.  A small *blend* (e.g. 0.15) nudges outliers toward their
+    neighbourhood without overwriting the per-gene spatial structure.
 
     Parameters
     ----------
-    positions : (N, 2) array — cell spatial coordinates
-    X         : (N, G) array — expression matrix
-    k         : int   — number of spatial neighbours
-    sigma_factor : float — multiplier on adaptive bandwidth
-                   (1.0 = median neighbour distance)
+    positions    : (N, 2) array — cell spatial coordinates
+    X            : (N, G) array — expression matrix
+    k            : int   — number of spatial neighbours (default 6)
+    sigma_factor : float — multiplier on Gaussian bandwidth
+    blend        : float in [0, 1] — 0 = keep original, 1 = full smooth
 
     Returns
     -------
-    X_smooth : (N, G) array
+    X_blended : (N, G) array — blend * smooth + (1 - blend) * original
     """
+    if blend <= 0:
+        return np.asarray(X, dtype=np.float32)
+
     tree = cKDTree(positions)
     dists, indices = tree.query(positions, k=k + 1)  # +1 for self
 
-    # Adaptive sigma: per-cell local bandwidth = median distance to k neighbours
-    # Use global median as a stable estimate
     median_dist = np.median(dists[:, 1:])
     sigma = median_dist * sigma_factor
     sigma = max(sigma, 1e-6)
@@ -164,13 +166,15 @@ def spatial_smooth_expression(positions, X, k=15, sigma_factor=1.0):
     X_smooth = np.empty_like(X)
 
     for i in range(len(positions)):
-        nbr_idx = indices[i]          # includes self at index 0
+        nbr_idx = indices[i]
         nbr_dists = dists[i]
         w = np.exp(-0.5 * (nbr_dists / sigma) ** 2)
         w /= w.sum()
         X_smooth[i] = (X[nbr_idx] * w[:, None]).sum(axis=0)
 
-    return X_smooth.astype(np.float32)
+    # Blend: mostly keep original, only nudge toward neighbourhood mean
+    result = (1.0 - blend) * X + blend * X_smooth
+    return result.astype(np.float32)
 
 
 def auto_patch_size(positions, target_cells_per_patch=60):
