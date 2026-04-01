@@ -107,12 +107,12 @@ def Generate_axialst(
     n_mag: float = 1.0,
     # Stage-3 params
     syn_mode: str = 'default',
-    k_sam: int = 10,
-    Beta: float = 100.0,
+    k_sam: int = 1,
+    Beta: float = 5.0,
     micro_env_key: str = 'mender',
-    smooth_k: int = 6,
+    smooth_k: int = 0,
     smooth_sigma: float = 1.0,
-    smooth_alpha: float = 0.15,
+    smooth_alpha: float = 0.0,
     # Stage-4 params
     compute_uncertainty: bool = True,
     gap_distance: float | None = None,

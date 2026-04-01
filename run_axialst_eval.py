@@ -229,13 +229,9 @@ for held_out, left, right in [(2, 1, 3), (4, 3, 5), (6, 5, 7)]:
         n_cell=slices[held_out].n_obs,
         n_mag=1.0,
         syn_mode='default',
-        k_sam=50,
-        Beta=100,
+        k_sam=1,
+        Beta=5,
         n_niches=20,
-        # Gentle spatial smoothing (15% blend with k-NN mean)
-        smooth_k=6,
-        smooth_sigma=1.0,
-        smooth_alpha=0.15,
         seed=42,
         verbose=True,
     )

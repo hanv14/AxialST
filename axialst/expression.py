@@ -31,12 +31,17 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
                                   niche_labels_virtual,
                                   niche_desc_refs,
                                   niche_desc_virtual,
-                                  alpha, k_sam=10, Beta=100,
-                                  smooth_k=6, smooth_sigma=1.0,
-                                  smooth_alpha=0.15,
+                                  alpha, k_sam=1, Beta=5,
+                                  smooth_k=0, smooth_sigma=1.0,
+                                  smooth_alpha=0.0,
                                   verbose=True):
     """
     Niche-coherent expression synthesis (Stage 3 — default mode).
+
+    For best spatial autocorrelation preservation, use k_sam=1 (single-
+    donor copy).  This directly inherits per-gene variance structure
+    from real data.  Higher k_sam averages donors, which inflates
+    Moran's I uniformly and degrades the per-gene correlation.
 
     Parameters
     ----------
@@ -48,10 +53,12 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     niche_desc_refs     : list of 2  (N_k, D) arrays  (MENDER / fallback)
     niche_desc_virtual  : (V, D) array
     alpha               : float  interpolation parameter
-    k_sam               : how many donors to draw per virtual cell
+    k_sam               : donors per virtual cell (1 = copy, >1 = average)
     Beta                : temperature for niche-similarity weighting
-    smooth_k            : spatial smoothing neighbours (0 = no smoothing)
+                          (keep low, e.g. 5, so spatial proximity dominates)
+    smooth_k            : spatial smoothing neighbours (0 = disabled)
     smooth_sigma        : bandwidth multiplier for spatial smoothing
+    smooth_alpha        : blend factor for smoothing (0 = disabled)
     verbose             : print progress
 
     Returns
@@ -83,12 +90,10 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     n_virtual   = len(virtual_adata)
     n_genes     = comb_X.shape[1]
 
-    # Spatial KD-tree for fallback and spatial proximity weighting
+    # Spatial KD-tree
     kdtree = cKDTree(comb_pos)
 
-    # Moderate spatial bandwidth: median NN distance × 3
-    # Balances locality (preserving spatial structure) against having
-    # enough donors for a reliable average.
+    # Spatial bandwidth: median NN distance × 3
     _nn_dists, _ = kdtree.query(comb_pos, k=2)
     sigma_spatial = float(np.median(_nn_dists[:, 1])) * 3.0
     sigma_spatial = max(sigma_spatial, 1.0)
@@ -105,9 +110,8 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
 
     rng = np.random.RandomState(42)
 
-    # Pre-query spatial neighbours for each virtual cell to accelerate
-    # candidate selection: only consider donors within a reasonable radius
-    max_radius = sigma_spatial * 4.0  # ~98% of Gaussian weight
+    # Pre-query spatial neighbours for each virtual cell
+    max_radius = sigma_spatial * 4.0
     virt_nbr_lists = kdtree.query_ball_point(virt_pos, r=max_radius)
 
     for i in range(n_virtual):
@@ -123,7 +127,7 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
             if ni >= 0 and comb_niche_labels is not None:
                 niche_mask = comb_niche_labels[nearby] == ni
                 joint_mask = type_mask & niche_mask
-                if joint_mask.sum() < 3:
+                if joint_mask.sum() < 1:
                     joint_mask = type_mask
             else:
                 joint_mask = type_mask
@@ -131,13 +135,13 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         else:
             cands = np.array([], dtype=int)
 
-        # Broaden to global type-match if too few local candidates
-        if len(cands) < 3:
+        # Broaden to global type-match if no local candidates
+        if len(cands) < 1:
             global_type_mask = comb_types == ct
             if ni >= 0 and comb_niche_labels is not None:
                 global_niche_mask = comb_niche_labels == ni
                 global_joint = global_type_mask & global_niche_mask
-                if global_joint.sum() >= 3:
+                if global_joint.sum() >= 1:
                     cands = np.where(global_joint)[0]
                 else:
                     cands = np.where(global_type_mask)[0]
@@ -145,8 +149,8 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
                 cands = np.where(global_type_mask)[0]
 
         if len(cands) == 0:
-            # Last resort: nearest neighbours regardless of type
-            _, nn = kdtree.query(virt_pos[i], k=min(k_sam, len(combined)))
+            # Last resort: nearest neighbour regardless of type
+            _, nn = kdtree.query(virt_pos[i], k=min(max(k_sam, 1), len(combined)))
             nn = np.atleast_1d(nn)
             fb_dists = np.linalg.norm(comb_pos[nn] - virt_pos[i], axis=1)
             fb_w = np.exp(-0.5 * (fb_dists / sigma_spatial) ** 2)
@@ -183,27 +187,27 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         else:
             w = np.ones(len(cands)) / len(cands)
 
-        # --- select top-k donors and compute weighted average ---
+        # --- select top-k donors ---
         k_use = min(k_sam, len(cands))
-        if len(cands) <= k_use:
-            sel = cands
-            sel_w = w
+        if k_use <= 1:
+            # Single-donor copy: pick the best donor, no averaging.
+            # This preserves per-gene variance structure exactly.
+            best = np.argmax(w)
+            virt_X[i] = comb_X[cands[best]]
+            donor_variances[i] = 0.0
+        elif len(cands) <= k_use:
+            virt_X[i] = (comb_X[cands] * w[:, None]).sum(axis=0)
+            if len(cands) > 1:
+                donor_variances[i] = float(comb_X[cands].var(axis=0).mean())
         else:
             top_k = np.argpartition(w, -k_use)[-k_use:]
             sel = cands[top_k]
             sel_w = w[top_k]
             sel_w /= sel_w.sum()
-
-        virt_X[i] = (comb_X[sel] * sel_w[:, None]).sum(axis=0)
-
-        # Donor expression variance (for uncertainty quantification)
-        if len(sel) > 1:
+            virt_X[i] = (comb_X[sel] * sel_w[:, None]).sum(axis=0)
             donor_variances[i] = float(comb_X[sel].var(axis=0).mean())
 
-    # --- Gentle spatial smoothing pass ---
-    # Light blending (default 15%) with k-NN neighbourhood mean.
-    # This nudges outlier cells toward local consensus without
-    # overwriting per-gene spatial autocorrelation structure.
+    # --- Optional spatial smoothing pass ---
     if smooth_k > 0 and smooth_alpha > 0 and n_virtual > smooth_k:
         if verbose:
             print(f"  Applying spatial smoothing (k={smooth_k}, "
@@ -216,7 +220,8 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
 
     if verbose:
         print(f"  Expression synthesized for {n_virtual} virtual cells "
-              f"(median donor pool = {int(np.median(donor_counts))})")
+              f"(k_sam={k_sam}, median donor pool = "
+              f"{int(np.median(donor_counts))})")
 
     return virtual_adata, donor_counts, donor_variances
 
