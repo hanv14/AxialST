@@ -10,6 +10,7 @@ Two modes:
   • 'fast'     – nearest same-type cell averaging (simpler, faster)
 """
 
+import warnings
 import numpy as np
 from scipy.spatial import cKDTree
 from sklearn.neighbors import NearestNeighbors
@@ -55,7 +56,7 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     alpha               : float  interpolation parameter
     k_sam               : donors per virtual cell (1 = copy, >1 = average)
     Beta                : temperature for niche-similarity weighting
-                          (keep low, e.g. 5, so spatial proximity dominates)
+                          (0 = pure spatial, >0 blends in niche similarity)
     smooth_k            : spatial smoothing neighbours (0 = disabled)
     smooth_sigma        : bandwidth multiplier for spatial smoothing
     smooth_alpha        : blend factor for smoothing (0 = disabled)
@@ -89,17 +90,26 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     virt_pos    = np.asarray(virtual_adata.obsm['spatial'])
     n_virtual   = len(virtual_adata)
     n_genes     = comb_X.shape[1]
+    n_ref       = len(combined)
 
     # Spatial KD-tree
     kdtree = cKDTree(comb_pos)
 
-    # Spatial bandwidth: tight to strongly favour nearest donors
-    _nn_dists, _ = kdtree.query(comb_pos, k=2)
-    sigma_spatial = float(np.median(_nn_dists[:, 1])) * 1.5
-    sigma_spatial = max(sigma_spatial, 1.0)
+    # Spatial bandwidth: adaptive to data scale (1.5× median NN distance)
+    _nn_dists, _ = kdtree.query(comb_pos, k=min(2, n_ref))
+    median_nn = float(np.median(_nn_dists[:, -1]))
+    sigma_spatial = median_nn * 1.5
+    sigma_spatial = max(sigma_spatial, median_nn * 0.5)  # no hard floor
 
-    # Pre-compute cosine similarities  (combined × virtual)
-    if niche_desc_virtual is not None and comb_niche_desc is not None:
+    # Pre-compute cosine similarities only when Beta > 0 (saves memory
+    # for large datasets: this is an O(R×V) dense matrix).
+    if Beta > 0 and niche_desc_virtual is not None and comb_niche_desc is not None:
+        # Guard against very large matrices (>1GB at float64)
+        mem_est = n_ref * n_virtual * 8  # bytes
+        if mem_est > 1e9:
+            warnings.warn(
+                f"Cosine similarity matrix would be {mem_est/1e9:.1f}GB "
+                f"({n_ref}×{n_virtual}). Consider Beta=0 for large datasets.")
         cos_sims = cos_sim(comb_niche_desc, niche_desc_virtual)  # (R, V)
     else:
         cos_sims = None
@@ -114,13 +124,22 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
     max_radius = sigma_spatial * 4.0
     virt_nbr_lists = kdtree.query_ball_point(virt_pos, r=max_radius)
 
-    # Pre-compute per-type indices for efficient global lookup
+    # Pre-compute per-type indices for efficient global lookup, and
+    # per-type KD-trees for efficient nearest-same-type queries on
+    # global fallback (avoids O(N) brute-force distance computation).
     unique_types = np.unique(comb_types)
-    type_to_indices = {t: np.where(comb_types == t)[0] for t in unique_types}
+    type_to_indices = {}
+    type_to_kdtree = {}
+    for t in unique_types:
+        idx = np.where(comb_types == t)[0]
+        type_to_indices[t] = idx
+        if len(idx) > 0:
+            type_to_kdtree[t] = cKDTree(comb_pos[idx])
 
     n_local = 0       # matched within base radius
     n_expanded = 0    # matched via expanded radius
     n_global = 0      # matched via global fallback
+    n_type_miss = 0   # no same-type donor anywhere
 
     for i in range(n_virtual):
         ct = virt_types[i]
@@ -146,10 +165,12 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
             else:
                 # --- 3) Global fallback ---
                 cands = type_to_indices.get(ct, np.array([], dtype=int))
-                n_global += 1
+                if len(cands) > 0:
+                    n_global += 1
 
         if len(cands) == 0:
             # Last resort: nearest cell regardless of type
+            n_type_miss += 1
             _, nn_idx = kdtree.query(virt_pos[i], k=1)
             nn_idx = np.atleast_1d(nn_idx)
             virt_X[i] = comb_X[nn_idx[0]]
@@ -163,23 +184,28 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         # avoids the saturation problem where all distant candidates get
         # the same clipped weight, making selection effectively random.
         if k_sam <= 1:
-            xy_dists = np.linalg.norm(comb_pos[cands] - virt_pos[i], axis=1)
-            nearest = np.argmin(xy_dists)
-            virt_X[i] = comb_X[cands[nearest]]
+            # Use per-type KD-tree for O(log N) lookup when global
+            if len(cands) > 100 and ct in type_to_kdtree:
+                _, local_idx = type_to_kdtree[ct].query(virt_pos[i], k=1)
+                virt_X[i] = comb_X[type_to_indices[ct][local_idx]]
+            else:
+                xy_dists = np.linalg.norm(comb_pos[cands] - virt_pos[i], axis=1)
+                nearest = np.argmin(xy_dists)
+                virt_X[i] = comb_X[cands[nearest]]
             donor_variances[i] = 0.0
             continue
 
-        # --- k_sam > 1: weighted averaging (unchanged) ---
+        # --- k_sam > 1: weighted averaging ---
         w_z = z_weights[cands]
 
         xy_dists = np.linalg.norm(comb_pos[cands] - virt_pos[i], axis=1)
         w_spatial = np.exp(-0.5 * (xy_dists / sigma_spatial) ** 2)
-        w_spatial = np.maximum(w_spatial, 1e-6)
+        w_spatial = np.maximum(w_spatial, 1e-12)
 
         w = w_z * w_spatial
 
         if Beta > 0 and cos_sims is not None:
-            w_niche = np.exp(Beta * cos_sims[cands, i])
+            w_niche = np.exp(np.clip(Beta * cos_sims[cands, i], -50, 50))
             w *= w_niche
         w_sum = w.sum()
         if w_sum > 0:
@@ -213,10 +239,19 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
 
     if verbose:
         print(f"  Expression synthesized for {n_virtual} virtual cells "
-              f"(k_sam={k_sam}, median donor pool = "
-              f"{int(np.median(donor_counts))})")
+              f"(k_sam={k_sam}, sigma_spatial={sigma_spatial:.2f}, "
+              f"median donor pool={int(np.median(donor_counts))})")
         print(f"  Donor matching: {n_local} local, "
               f"{n_expanded} expanded, {n_global} global")
+        if n_type_miss > 0:
+            print(f"  WARNING: {n_type_miss} cells had no same-type donor "
+                  f"(used nearest-any-type fallback)")
+
+    if n_type_miss > n_virtual * 0.05:
+        warnings.warn(
+            f"{n_type_miss}/{n_virtual} virtual cells ({100*n_type_miss/n_virtual:.1f}%) "
+            f"had no same-type donor in reference data. Check that cell type "
+            f"labels match between reference and virtual sections.")
 
     return virtual_adata, donor_counts, donor_variances
 
@@ -240,7 +275,10 @@ def synthesize_expression_fast(ref_adatas, virtual_adata,
     comb_types = np.asarray(combined.obs[cell_type_key].values)
     comb_pos   = np.asarray(combined.obsm['spatial'])
 
-    nn = NearestNeighbors(n_neighbors=min(10, len(combined))).fit(comb_pos)
+    # Adaptive k for NN search: scale with data size and type diversity
+    n_types = len(np.unique(comb_types))
+    k_search = min(max(10, n_types * 3), len(combined))
+    nn = NearestNeighbors(n_neighbors=k_search).fit(comb_pos)
     distances, indices = nn.kneighbors(virtual_adata.obsm['spatial'])
 
     virt_types = np.asarray(virtual_adata.obs[cell_type_key].values)

@@ -167,8 +167,18 @@ def generate_virtual_cells(interp_tp, patch_size, n_cell=None,
     compositions = interp_tp.eval_composition(centres)    # (P, T)
     densities    = interp_tp.eval_density(centres)        # (P,)
 
-    # Filter empty patches (far outside tissue)
-    thresh = densities.max() * 0.01 if densities.max() > 0 else 0
+    # Filter empty patches (far outside tissue).
+    # Use a robust threshold: patches below the 5th percentile of
+    # non-zero densities are excluded.  This adapts to any density
+    # distribution (uniform, bimodal, skewed) better than a fixed %.
+    if densities.max() > 0:
+        nonzero = densities[densities > 0]
+        if len(nonzero) > 0:
+            thresh = np.percentile(nonzero, 5) * 0.5
+        else:
+            thresh = 0
+    else:
+        thresh = 0
     active = densities > thresh
     centres      = centres[active]
     compositions = compositions[active]

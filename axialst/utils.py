@@ -42,6 +42,7 @@ def compute_composition_at_points(cell_positions, cell_types, type_list,
     """
     n_cells = len(cell_types)
     n_types = len(type_list)
+    n_query = len(query_points)
     type_to_idx = {t: i for i, t in enumerate(type_list)}
 
     # One-hot encoding  (N, T)
@@ -51,12 +52,25 @@ def compute_composition_at_points(cell_positions, cell_types, type_list,
         if idx is not None:
             onehot[i, idx] = 1.0
 
-    # Pairwise distances  (Q, N)
-    dists = cdist(np.asarray(query_points, dtype=np.float64),
-                  np.asarray(cell_positions, dtype=np.float64))
-    weights = gaussian_kernel(dists, sigma)          # (Q, N)
+    cell_positions = np.asarray(cell_positions, dtype=np.float64)
+    query_points = np.asarray(query_points, dtype=np.float64)
 
-    compositions = weights @ onehot                  # (Q, T)
+    # Use chunked computation for large datasets to avoid O(Q*N) memory
+    # (threshold: ~500MB at float64)
+    max_elements = 64_000_000  # ~500MB
+    if n_query * n_cells > max_elements:
+        chunk_size = max(1, max_elements // n_cells)
+        compositions = np.zeros((n_query, n_types), dtype=np.float64)
+        for start in range(0, n_query, chunk_size):
+            end = min(start + chunk_size, n_query)
+            dists = cdist(query_points[start:end], cell_positions)
+            weights = gaussian_kernel(dists, sigma)
+            compositions[start:end] = weights @ onehot
+    else:
+        dists = cdist(query_points, cell_positions)
+        weights = gaussian_kernel(dists, sigma)
+        compositions = weights @ onehot
+
     totals = compositions.sum(axis=1, keepdims=True)
     totals = np.where(totals == 0, 1.0, totals)
     compositions /= totals
@@ -69,10 +83,25 @@ def compute_density_at_points(cell_positions, query_points, sigma):
 
     Returns unnormalised density (higher = more cells nearby).
     """
-    dists = cdist(np.asarray(query_points, dtype=np.float64),
-                  np.asarray(cell_positions, dtype=np.float64))
-    weights = gaussian_kernel(dists, sigma)
-    return weights.sum(axis=1)
+    cell_positions = np.asarray(cell_positions, dtype=np.float64)
+    query_points = np.asarray(query_points, dtype=np.float64)
+    n_query = len(query_points)
+    n_cells = len(cell_positions)
+
+    # Chunked for large datasets
+    max_elements = 64_000_000
+    if n_query * n_cells > max_elements:
+        chunk_size = max(1, max_elements // n_cells)
+        density = np.zeros(n_query, dtype=np.float64)
+        for start in range(0, n_query, chunk_size):
+            end = min(start + chunk_size, n_query)
+            dists = cdist(query_points[start:end], cell_positions)
+            density[start:end] = gaussian_kernel(dists, sigma).sum(axis=1)
+        return density
+    else:
+        dists = cdist(query_points, cell_positions)
+        weights = gaussian_kernel(dists, sigma)
+        return weights.sum(axis=1)
 
 
 def compute_niche_descriptors_simple(positions, cell_types, type_list,
@@ -125,12 +154,21 @@ def safe_to_dense(X):
 
 def auto_sigma(positions):
     """
-    Heuristic KDE bandwidth: 5 × median nearest-neighbour distance.
+    Heuristic KDE bandwidth: 3 × median nearest-neighbour distance.
+
+    Adapts to any coordinate scale (microns, pixels, arbitrary units).
+    The minimum is clamped to half the median NN distance to avoid
+    degenerate zero bandwidth, rather than a hardcoded constant.
     """
+    n = len(positions)
+    if n < 2:
+        return 1.0
     tree = cKDTree(positions)
-    dists, _ = tree.query(positions, k=2)       # k=2: self + nearest
-    median_nn = np.median(dists[:, 1])
-    return float(max(median_nn * 3.0, 1.0))
+    dists, _ = tree.query(positions, k=min(2, n))
+    median_nn = float(np.median(dists[:, -1]))
+    if median_nn <= 0:
+        return 1.0
+    return float(max(median_nn * 3.0, median_nn * 0.5))
 
 
 def spatial_smooth_expression(positions, X, k=6, sigma_factor=1.0,
@@ -155,12 +193,17 @@ def spatial_smooth_expression(positions, X, k=6, sigma_factor=1.0,
     if blend <= 0:
         return np.asarray(X, dtype=np.float32)
 
+    n = len(positions)
+    actual_k = min(k, n - 1)  # can't have more neighbours than cells
+    if actual_k < 1:
+        return np.asarray(X, dtype=np.float32)
+
     tree = cKDTree(positions)
-    dists, indices = tree.query(positions, k=k + 1)  # +1 for self
+    dists, indices = tree.query(positions, k=actual_k + 1)  # +1 for self
 
     median_dist = np.median(dists[:, 1:])
     sigma = median_dist * sigma_factor
-    sigma = max(sigma, 1e-6)
+    sigma = max(sigma, median_dist * 0.1 if median_dist > 0 else 1e-6)
 
     X = np.asarray(X, dtype=np.float64)
     X_smooth = np.empty_like(X)
@@ -181,11 +224,24 @@ def auto_patch_size(positions, target_cells_per_patch=60):
     """
     Heuristic patch size so that the average patch contains roughly
     *target_cells_per_patch* cells.
+
+    Adapts to any coordinate scale.  The minimum patch size is clamped
+    to 2× median NN distance (data-driven) rather than a fixed constant.
     """
     n_cells = len(positions)
+    if n_cells < 2:
+        return 100.0
     x_range = positions[:, 0].max() - positions[:, 0].min()
     y_range = positions[:, 1].max() - positions[:, 1].min()
-    area = max(x_range * y_range, 1.0)
+    area = max(x_range * y_range, 1e-10)
     density = n_cells / area
     patch_area = target_cells_per_patch / max(density, 1e-10)
-    return float(max(np.sqrt(patch_area), 10.0))
+    patch_size = float(np.sqrt(patch_area))
+
+    # Data-driven minimum: at least 2× median NN distance
+    tree = cKDTree(positions)
+    dists, _ = tree.query(positions, k=min(2, n_cells))
+    median_nn = float(np.median(dists[:, -1]))
+    min_size = max(median_nn * 2.0, 1e-6)
+
+    return float(max(patch_size, min_size))

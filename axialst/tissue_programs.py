@@ -16,6 +16,7 @@ import io
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.optimize import linear_sum_assignment
+from scipy.spatial import cKDTree
 from scipy.spatial.distance import cdist as scipy_cdist
 
 from .utils import (compute_composition_at_points, compute_density_at_points,
@@ -200,10 +201,13 @@ def extract_tissue_program(adata, cell_type_key, type_list, sigma,
     tp.sigma       = sigma
     tp.adata       = adata
 
-    # Global density
+    # Global density (adaptive floor: avoid hardcoded 1.0)
     x_span = tp.positions[:, 0].max() - tp.positions[:, 0].min()
     y_span = tp.positions[:, 1].max() - tp.positions[:, 1].min()
-    area = max(x_span * y_span, 1.0)
+    area = x_span * y_span
+    if area <= 0:
+        # Degenerate: collinear or single-point data
+        area = max(x_span + y_span, 1e-10) ** 2
     tp.cell_density = len(tp.positions) / area
 
     # ---- niche descriptors -------------------------------------------
@@ -212,11 +216,27 @@ def extract_tissue_program(adata, cell_type_key, type_list, sigma,
     else:
         if verbose:
             print("  Computing fallback niche descriptors (composition in radius)…")
+        # Adaptive radius: use data-driven default if niche_radius seems
+        # unreasonable for this dataset's coordinate scale
+        tree = cKDTree(tp.positions)
+        nn_dists, _ = tree.query(tp.positions, k=min(2, len(tp.positions)))
+        median_nn = float(np.median(nn_dists[:, -1])) if len(tp.positions) > 1 else 1.0
+        # Use provided niche_radius, but warn if it's very different
+        # from the data scale
+        if niche_radius < median_nn * 0.5 or niche_radius > median_nn * 100:
+            effective_radius = median_nn * 10.0
+            if verbose:
+                print(f"  niche_radius={niche_radius:.1f} seems mismatched with "
+                      f"data scale (median NN={median_nn:.1f}), "
+                      f"using {effective_radius:.1f} instead")
+        else:
+            effective_radius = niche_radius
         tp.niche_descriptors = compute_niche_descriptors_simple(
-            tp.positions, tp.cell_types, type_list, radius=niche_radius)
+            tp.positions, tp.cell_types, type_list, radius=effective_radius)
 
     # ---- cluster into niche archetypes -------------------------------
-    actual_k = min(n_niches, len(tp.positions) // 5)
+    # Need at least 3 cells per cluster for meaningful niche definition
+    actual_k = min(n_niches, max(len(tp.positions) // 3, 2))
     actual_k = max(actual_k, 2)
 
     km = KMeans(n_clusters=actual_k, random_state=42, n_init=10)

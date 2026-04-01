@@ -53,9 +53,12 @@ def effective_donor_pool_uncertainty(donor_counts, donor_variances,
 
     u_pool = np.exp(-counts / tau)
 
-    # Normalise variance to [0, 1] range for stable combination
-    v_max = variances.max() if variances.max() > 0 else 1.0
-    v_norm = variances / v_max
+    # Normalise variance to [0, 1] range for stable combination.
+    # Use robust scaling (95th percentile) to handle outliers.
+    v_max = np.percentile(variances, 95) if len(variances) > 0 else 0.0
+    if v_max <= 0:
+        v_max = variances.max() if variances.max() > 0 else 1.0
+    v_norm = np.minimum(variances / v_max, 1.0)
 
     u_effective = u_pool * (1.0 + var_scale * v_norm)
     # Clip to [0, 1]
@@ -132,8 +135,11 @@ def donor_variance_uncertainty(donor_variances):
     Returns (V,) array in [0, 1].
     """
     v = np.asarray(donor_variances, dtype=np.float64)
-    v_max = v.max() if v.max() > 0 else 1.0
-    return v / v_max
+    # Robust normalisation with 95th percentile to handle outliers
+    v_max = np.percentile(v, 95) if len(v) > 0 else 0.0
+    if v_max <= 0:
+        v_max = v.max() if v.max() > 0 else 1.0
+    return np.minimum(v / v_max, 1.0)
 
 
 # ===================================================================
@@ -159,6 +165,10 @@ def compute_confidence(u1, u2, u3, u4, u5=None,
     confidence : (V,) array in (0, 1)  — higher is more trustworthy
     """
     if weights is None:
+        # Default weights empirically tuned on STARmap leave-one-out
+        # evaluation.  For other datasets, consider using
+        # calibrate_weights() on held-out data to fit dataset-specific
+        # weights via logistic regression.
         if u5 is not None:
             # 5-source weights: pool, niche, cross-sect, z-dist, donor-var
             weights = [1.0, 0.8, 1.2, 0.6, 0.9]
