@@ -110,54 +110,68 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
 
     rng = np.random.RandomState(42)
 
-    # Pre-query spatial neighbours for each virtual cell
+    # Pre-query spatial neighbours at base radius
     max_radius = sigma_spatial * 4.0
     virt_nbr_lists = kdtree.query_ball_point(virt_pos, r=max_radius)
 
+    # Pre-compute per-type indices for efficient global lookup
+    unique_types = np.unique(comb_types)
+    type_to_indices = {t: np.where(comb_types == t)[0] for t in unique_types}
+
+    n_local = 0       # matched within base radius
+    n_expanded = 0    # matched via expanded radius
+    n_global = 0      # matched via global fallback
+
     for i in range(n_virtual):
         ct = virt_types[i]
-        ni = niche_labels_virtual[i] if niche_labels_virtual is not None else -1
 
-        # --- spatial pre-filter: same type within spatial radius ---
-        # Skip niche filtering to maximise spatial locality of donors.
-        # Niche constraints can exclude the spatially nearest same-type
-        # cell, degrading spatial autocorrelation preservation.
+        # --- 1) Base radius: same type within sigma*4 ---
         nearby = np.array(virt_nbr_lists[i], dtype=int) if virt_nbr_lists[i] else np.array([], dtype=int)
+        cands = nearby[comb_types[nearby] == ct] if len(nearby) > 0 else np.array([], dtype=int)
 
-        if len(nearby) > 0:
-            type_mask = comb_types[nearby] == ct
-            cands = nearby[type_mask]
+        if len(cands) >= 1:
+            n_local += 1
         else:
-            cands = np.array([], dtype=int)
-
-        # Broaden to global type-match if no local candidates
-        if len(cands) < 1:
-            cands = np.where(comb_types == ct)[0]
+            # --- 2) Adaptive expansion: 8σ then 16σ ---
+            for exp_mult in (8.0, 16.0):
+                nearby_exp = np.array(
+                    kdtree.query_ball_point(virt_pos[i], r=sigma_spatial * exp_mult),
+                    dtype=int)
+                if len(nearby_exp) > 0:
+                    cands = nearby_exp[comb_types[nearby_exp] == ct]
+                if len(cands) >= 1:
+                    break
+            if len(cands) >= 1:
+                n_expanded += 1
+            else:
+                # --- 3) Global fallback ---
+                cands = type_to_indices.get(ct, np.array([], dtype=int))
+                n_global += 1
 
         if len(cands) == 0:
-            # Last resort: nearest neighbour regardless of type
-            _, nn = kdtree.query(virt_pos[i], k=min(max(k_sam, 1), len(combined)))
-            nn = np.atleast_1d(nn)
-            fb_dists = np.linalg.norm(comb_pos[nn] - virt_pos[i], axis=1)
-            fb_w = np.exp(-0.5 * (fb_dists / sigma_spatial) ** 2)
-            fb_w_sum = fb_w.sum()
-            if fb_w_sum > 0:
-                fb_w /= fb_w_sum
-            else:
-                fb_w = np.ones(len(nn)) / len(nn)
-            virt_X[i] = (comb_X[nn] * fb_w[:, None]).sum(axis=0)
-            donor_counts[i] = len(nn)
-            if len(nn) > 1:
-                donor_variances[i] = float(comb_X[nn].var(axis=0).mean())
+            # Last resort: nearest cell regardless of type
+            _, nn_idx = kdtree.query(virt_pos[i], k=1)
+            nn_idx = np.atleast_1d(nn_idx)
+            virt_X[i] = comb_X[nn_idx[0]]
+            donor_counts[i] = 1
             continue
 
         donor_counts[i] = len(cands)
 
-        # --- weights: z-proximity × spatial proximity ---
-        # Niche similarity (Beta) is optional; Beta=0 disables it.
+        # --- For k_sam=1, pick the nearest same-type cell by distance ---
+        # Using raw distance (argmin) instead of Gaussian weight (argmax)
+        # avoids the saturation problem where all distant candidates get
+        # the same clipped weight, making selection effectively random.
+        if k_sam <= 1:
+            xy_dists = np.linalg.norm(comb_pos[cands] - virt_pos[i], axis=1)
+            nearest = np.argmin(xy_dists)
+            virt_X[i] = comb_X[cands[nearest]]
+            donor_variances[i] = 0.0
+            continue
+
+        # --- k_sam > 1: weighted averaging (unchanged) ---
         w_z = z_weights[cands]
 
-        # Spatial proximity: Gaussian kernel on xy-distance
         xy_dists = np.linalg.norm(comb_pos[cands] - virt_pos[i], axis=1)
         w_spatial = np.exp(-0.5 * (xy_dists / sigma_spatial) ** 2)
         w_spatial = np.maximum(w_spatial, 1e-6)
@@ -173,15 +187,8 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         else:
             w = np.ones(len(cands)) / len(cands)
 
-        # --- select top-k donors ---
         k_use = min(k_sam, len(cands))
-        if k_use <= 1:
-            # Single-donor copy: pick the best donor, no averaging.
-            # This preserves per-gene variance structure exactly.
-            best = np.argmax(w)
-            virt_X[i] = comb_X[cands[best]]
-            donor_variances[i] = 0.0
-        elif len(cands) <= k_use:
+        if len(cands) <= k_use:
             virt_X[i] = (comb_X[cands] * w[:, None]).sum(axis=0)
             if len(cands) > 1:
                 donor_variances[i] = float(comb_X[cands].var(axis=0).mean())
@@ -208,6 +215,8 @@ def synthesize_expression_default(ref_adatas, virtual_adata,
         print(f"  Expression synthesized for {n_virtual} virtual cells "
               f"(k_sam={k_sam}, median donor pool = "
               f"{int(np.median(donor_counts))})")
+        print(f"  Donor matching: {n_local} local, "
+              f"{n_expanded} expanded, {n_global} global")
 
     return virtual_adata, donor_counts, donor_variances
 
